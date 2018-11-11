@@ -1,8 +1,16 @@
 import asyncio
 import ipaddress
 import socket
+import time
 from struct import pack, unpack
+from typing import Dict
 from uuid import getnode as get_mac
+
+
+class DataEvent(asyncio.Event):
+    def __init__(self, *args, **kwargs):
+        self.data = None
+        super(DataEvent, self).__init__(*args, **kwargs)
 
 
 def ip_to_bytes(ip: ipaddress.IPv4Address):
@@ -89,20 +97,57 @@ async def recv_forever(_socket, queue):
         await queue.put(_packet)
 
 
-async def recv_worker(queue, source_mac: str):
+async def recv_worker(queue, source_mac: str, probe_map: Dict):
     source_mac_bytes = mac_to_bytes(source_mac)
     while True:
         _packet = await queue.get()
         result = parse_arp(_packet, source_mac_bytes)
         if result is not None:
-            print(result)
+            ip = result['remote_ip']
+            # probe_map[ip][1].data = result
+            probe_map[ip][1].set()
 
 
-async def arp_send_loop(arp_factory, target_ip: ipaddress.IPv4Address):
-    arp = arp_factory(target_ip)
+def create_arp_probe_coro(arp_factory, target_ip: ipaddress.IPv4Address, interval: float = 0.5, timeout: float = 0.25):
+    global results
+    event = DataEvent()
+    assert interval > timeout
+
+    async def arp_send_loop():
+        arp = arp_factory(target_ip)
+        while True:
+            send_time = time.time()
+            await send_queue.put(arp)
+            try:
+                await asyncio.wait_for(event.wait(), timeout)
+                # result = event.data
+                # print(result)
+                recv_time = time.time()
+                time_taken = recv_time - send_time
+                results[target_ip] = 1
+            except asyncio.TimeoutError:
+                # print("TOOK TOO LONG!!!")
+                time_taken = timeout
+                results[target_ip] = 0
+            finally:
+                event.clear()
+            # print(f"time for response: {time_taken}")
+            sleep_time = interval - time_taken
+            if sleep_time > 0:
+                await asyncio.sleep(interval - time_taken)
+            else:
+                print("We're falling behind schedule.")
+    return arp_send_loop(), event
+
+
+async def results_printer():
+    global results
     while True:
-        await send_queue.put(arp)
-        await asyncio.sleep(0.5)
+        await asyncio.sleep(1)
+        print(sum(results.values()))
+        for ip, value in results.items():
+            if value:
+                print(ip)
 
 
 if __name__ == "__main__":
@@ -118,14 +163,30 @@ if __name__ == "__main__":
     sock.setblocking(False)
     sock.bind(('eth0', 0))
 
+    event_map = dict()
+
     loop = asyncio.get_event_loop()
     recv_coro = recv_forever(sock, recv_queue)
-    work_coro = recv_worker(recv_queue, local_mac_str)
     send_coro = send_forever(sock, send_queue)
-    arp_loop_coro = arp_send_loop(arp_factory_from_source(local_mac_str, local_ip),
-                                  ipaddress.IPv4Address('192.168.0.14'))
-    arp_loop_coro2 = arp_send_loop(arp_factory_from_source(local_mac_str, local_ip),
-                                   ipaddress.IPv4Address('192.168.0.1'))
 
-    loop.run_until_complete(asyncio.gather(recv_coro, work_coro, send_coro, arp_loop_coro, arp_loop_coro2))
+    results = {}
+
+    targets = [
+        # ipaddress.IPv4Address('192.168.0.14'),
+        # ipaddress.IPv4Address('192.168.0.1'),
+        # ipaddress.IPv4Address('192.168.0.11'),
+    ]
+    for ii in range(1, 256):
+        targets.append(ipaddress.IPv4Address('192.168.0.1'))
+
+    arp_probes = {
+        ip: create_arp_probe_coro(arp_factory_from_source(local_mac_str, local_ip), ip)
+        for ip in targets
+    }
+    arp_coros = [probe[0] for probe in arp_probes.values()]
+    work_coro = recv_worker(recv_queue, local_mac_str, arp_probes)
+
+    results_coro = results_printer()
+
+    loop.run_until_complete(asyncio.gather(recv_coro, work_coro, send_coro, results_coro, *arp_coros))
     loop.close()
