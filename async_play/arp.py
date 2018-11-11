@@ -97,55 +97,59 @@ async def recv_forever(_socket, queue):
         await queue.put(_packet)
 
 
-async def recv_worker(queue, source_mac: str, probe_map: Dict):
+async def recv_worker(queue, source_mac: str, _time_taken_map: Dict):
     source_mac_bytes = mac_to_bytes(source_mac)
     while True:
         _packet = await queue.get()
         result = parse_arp(_packet, source_mac_bytes)
         if result is not None:
             ip = result['remote_ip']
-            # probe_map[ip][1].data = result
-            probe_map[ip][1].set()
+            _time_taken_map[ip] = time.time()
 
 
-def create_arp_probe_coro(arp_factory, target_ip: ipaddress.IPv4Address, interval: float = 0.5, timeout: float = 0.25):
-    global results
+def create_arp_probe_coro(arp_factory, target_ip: ipaddress.IPv4Address, _time_taken_map: Dict, _results_map: Dict,
+                          interval: float = 0.5, timeout: float = 0.05):
+    global slow_bins
     event = DataEvent()
     assert interval > timeout
 
     async def arp_send_loop():
         arp = arp_factory(target_ip)
         while True:
-            send_time = time.time()
+            start_time = time.time()
             await send_queue.put(arp)
-            try:
-                await asyncio.wait_for(event.wait(), timeout)
-                # result = event.data
-                # print(result)
-                recv_time = time.time()
-                time_taken = recv_time - send_time
-                results[target_ip] = 1
-            except asyncio.TimeoutError:
-                # print("TOOK TOO LONG!!!")
-                time_taken = timeout
-                results[target_ip] = 0
-            finally:
-                event.clear()
-            # print(f"time for response: {time_taken}")
-            sleep_time = interval - time_taken
-            if sleep_time > 0:
-                await asyncio.sleep(interval - time_taken)
+            await asyncio.sleep(timeout)
+            end_time = time.time()
+            actual_waited_time = end_time - start_time
+            recv_time = _time_taken_map.get(target_ip)
+            # If the return hasn't been set before timeout, then we haven't received a response to the probe.
+            if recv_time is not None:
+                _results_map[target_ip] = 1
             else:
-                print("We're falling behind schedule.")
+                _results_map[target_ip] = 0
+            _time_taken_map[target_ip] = None
+
+            if actual_waited_time > interval:
+                slow_bins['interval'] += 1
+            elif actual_waited_time > 4 * timeout:
+                slow_bins[4] += 1
+            elif actual_waited_time > 2 * timeout:
+                slow_bins[2] += 1
+            else:
+                await asyncio.sleep(interval - actual_waited_time)
+
     return arp_send_loop(), event
 
 
-async def results_printer():
-    global results
+async def results_printer(_results_map):
+    global slow_bins
     while True:
         await asyncio.sleep(1)
-        print(sum(results.values()))
-        for ip, value in results.items():
+        print(slow_bins)
+        for key in slow_bins:
+            slow_bins[key] = 0
+        print(sum(_results_map.values()))
+        for ip, value in _results_map.items():
             if value:
                 print(ip)
 
@@ -170,6 +174,9 @@ if __name__ == "__main__":
     send_coro = send_forever(sock, send_queue)
 
     results = {}
+    time_taken_map = {}
+    from collections import defaultdict
+    slow_bins = defaultdict(int)
 
     targets = [
         # ipaddress.IPv4Address('192.168.0.14'),
@@ -177,16 +184,16 @@ if __name__ == "__main__":
         # ipaddress.IPv4Address('192.168.0.11'),
     ]
     for ii in range(1, 256):
-        targets.append(ipaddress.IPv4Address('192.168.0.1'))
+        targets.append(ipaddress.IPv4Address('192.168.0.%s' % ii))
 
     arp_probes = {
-        ip: create_arp_probe_coro(arp_factory_from_source(local_mac_str, local_ip), ip)
+        ip: create_arp_probe_coro(arp_factory_from_source(local_mac_str, local_ip), ip, time_taken_map, results)
         for ip in targets
     }
     arp_coros = [probe[0] for probe in arp_probes.values()]
-    work_coro = recv_worker(recv_queue, local_mac_str, arp_probes)
+    work_coro = recv_worker(recv_queue, local_mac_str, time_taken_map)
 
-    results_coro = results_printer()
+    results_coro = results_printer(results)
 
     loop.run_until_complete(asyncio.gather(recv_coro, work_coro, send_coro, results_coro, *arp_coros))
     loop.close()
